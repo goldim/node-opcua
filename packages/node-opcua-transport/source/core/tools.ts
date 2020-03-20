@@ -1,15 +1,13 @@
-/**
- * @module node-opcua-transport
- */
 import * as url from "url";
 
 import { assert } from "node-opcua-assert";
 import { BinaryStream, OutputBinaryStream } from "node-opcua-binary-stream";
-import { createFastUninitializedBuffer } from "node-opcua-buffer-utils";
 import { readMessageHeader } from "node-opcua-chunkmanager";
-import { BaseUAObject } from "node-opcua-factory";
 import { TCPErrorMessage } from "./TCPErrorMessage";
-import { UrlWithStringQuery } from "url";
+import { BaseUAObject } from "node-opcua-factory";
+import { createFastUninitializedBuffer } from "node-opcua-buffer-utils";
+
+export type ConstructorFunc = new (...args: any[]) => BaseUAObject;
 
 function is_valid_msg_type(msgType: string): boolean {
     assert(["HEL", "ACK", "ERR",   // Connection Layer
@@ -18,7 +16,31 @@ function is_valid_msg_type(msgType: string): boolean {
     return true;
 }
 
-export type ConstructorFunc = new (...args: any[]) => BaseUAObject;
+// opc.tcp://xleuri11022:51210/UA/SampleServer
+export function parseEndpointUrl(endpointUrl: string): url.Url {
+    const _url =  url.parse(endpointUrl);
+    if (!_url.protocol || !_url.hostname) {
+        throw new Error("Invalid endpoint url " + endpointUrl);
+    }
+    return _url;
+}
+
+export function writeTCPMessageHeader(msgType: string, chunkType: string, totalLength: number, stream: OutputBinaryStream) {
+
+    if (stream instanceof Buffer) {
+        stream = new BinaryStream(stream);
+    }
+    assert(is_valid_msg_type(msgType));
+    assert(["A", "F", "C"].indexOf(chunkType) !== -1);
+
+    stream.writeUInt8(msgType.charCodeAt(0));
+    stream.writeUInt8(msgType.charCodeAt(1));
+    stream.writeUInt8(msgType.charCodeAt(2));
+    // Chunk type
+    stream.writeUInt8(chunkType.charCodeAt(0)); // reserved
+
+    stream.writeUInt32(totalLength);
+}
 
 export function decodeMessage(stream: BinaryStream, classNameConstructor: ConstructorFunc): BaseUAObject {
 
@@ -50,56 +72,6 @@ export function packTcpMessage(msgType: string, encodableObject: BaseUAObject): 
     encodeMessage(msgType, encodableObject, stream);
 
     return messageChunk;
-
-}
-
-// opc.tcp://xleuri11022:51210/UA/SampleServer
-export function parseEndpointUrl(endpointUrl: string): url.Url {
-    const _url =  url.parse(endpointUrl);
-    if (!_url.protocol || !_url.hostname) {
-        throw new Error("Invalid endpoint url " + endpointUrl);
-    }
-    return _url;
-/*
-    const r = /^([a-z.]*):\/\/([a-zA-Z_\-.\-0-9]*):([0-9]*)(\/.*){0,1}/;
-
-    const matches = r.exec(endpointUrl);
-
-    if (!matches) {
-        throw new Error("Invalid endpoint url " + endpointUrl);
-    }
-    return {
-        protocol: matches[1],
-
-        hostname: matches[2],
-
-        port: parseInt(matches[3], 10),
-
-        address: matches[4] || ""
-    };
-   */
-}
-
-export function is_valid_endpointUrl(endpointUrl: string): boolean {
-    const e = parseEndpointUrl(endpointUrl);
-    return e.hasOwnProperty("hostname");
-}
-
-export function writeTCPMessageHeader(msgType: string, chunkType: string, totalLength: number, stream: OutputBinaryStream) {
-
-    if (stream instanceof Buffer) {
-        stream = new BinaryStream(stream);
-    }
-    assert(is_valid_msg_type(msgType));
-    assert(["A", "F", "C"].indexOf(chunkType) !== -1);
-
-    stream.writeUInt8(msgType.charCodeAt(0));
-    stream.writeUInt8(msgType.charCodeAt(1));
-    stream.writeUInt8(msgType.charCodeAt(2));
-    // Chunk type
-    stream.writeUInt8(chunkType.charCodeAt(0)); // reserved
-
-    stream.writeUInt32(totalLength);
 }
 
 function encodeMessage(msgType: string, messageContent: BaseUAObject, stream: OutputBinaryStream) {
@@ -110,4 +82,9 @@ function encodeMessage(msgType: string, messageContent: BaseUAObject, stream: Ou
     writeTCPMessageHeader(msgType, "F", totalLength, stream);
     messageContent.encode(stream);
     assert(totalLength === stream.length, "invalid message size");
+}
+
+export function is_valid_endpointUrl(endpointUrl: string): boolean {
+    const e = parseEndpointUrl(endpointUrl);
+    return e.hasOwnProperty("hostname");
 }

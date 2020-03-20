@@ -32,7 +32,7 @@ import {
     MessageSecurityMode
 } from "node-opcua-service-secure-channel";
 import { StatusCodes } from "node-opcua-status-code";
-import { ClientTCP_transport } from "node-opcua-transport";
+import { Transport } from "node-opcua-transport";
 
 import {
     BaseUAObject
@@ -280,11 +280,11 @@ export class ClientSecureChannelLayer extends EventEmitter {
     }
 
     get bytesRead(): number {
-        return this._transport ? this._transport.bytesRead : 0;
+        return this._stream ? this._stream.bytesRead : 0;
     }
 
     get bytesWritten(): number {
-        return this._transport ? this._transport.bytesWritten : 0;
+        return this._stream ? this._stream.bytesWritten : 0;
     }
 
     get transactionsPerformed(): number {
@@ -304,7 +304,10 @@ export class ClientSecureChannelLayer extends EventEmitter {
     public channelId: number;
 
     private _lastRequestId: number;
-    private _transport: any;
+    private _client: Transport.IClient | null;
+    private _stream: Transport.IStream | null;
+    private _connection: Transport.IConnection | null;
+    private sendBufferSize: number;
     private readonly parent: ClientSecureChannelParent;
 
     private clientNonce: any;
@@ -335,7 +338,9 @@ export class ClientSecureChannelLayer extends EventEmitter {
 
     constructor(options: ClientSecureChannelLayerOptions) {
         super();
-
+        this._stream = null;
+        this._connection = null;
+        this.sendBufferSize = 0;
         this.securityHeader = null;
         this.receiverCertificate = null;
         this.securityToken = null;
@@ -351,7 +356,7 @@ export class ClientSecureChannelLayer extends EventEmitter {
         assert(this instanceof ClientSecureChannelLayer);
 
         this._isOpened = false;
-        this._transport = null;
+        this._client = null;
         this._lastRequestId = 0;
         this.parent = options.parent;
         this.clientNonce = null; // will be created when needed
@@ -522,21 +527,36 @@ export class ClientSecureChannelLayer extends EventEmitter {
 
         this.endpointUrl = endpointUrl;
 
-        const transport = new ClientTCP_transport();
-        transport.timeout = this.transportTimeout;
+        this._client = Transport.Factory.getClient(endpointUrl);
+        this._client.timeout = this.transportTimeout;
+        var con = this._connection = this._client.createConnection("");
 
+        con.on("connect", (stream: Transport.IStream)=>{
+            this._stream = stream;
+            this.sendBufferSize = stream.sendBufferSize;
+            stream.on("message", (messageChunk: Buffer) => {
+                /**
+                 * notify the observers that ClientSecureChannelLayer has received a message chunk
+                 * @event receive_chunk
+                 * @param message_chunk
+                 */
+                this.emit("receive_chunk", messageChunk);
+                this._on_receive_message_chunk(messageChunk);
+            });
+        });
+        
         this._establish_connection(
-            transport,
+            con,
             endpointUrl,
             (err?: Error) => {
 
                 if (err) {
                     debugLog(chalk.red("cannot connect to server"));
-                    transport.dispose();
+                    con.dispose();
                     return callback(err);
                 }
 
-                this._on_connection(transport, callback);
+                this._on_connection(con, callback);
 
             }
         );
@@ -549,9 +569,9 @@ export class ClientSecureChannelLayer extends EventEmitter {
             this.__call.abort();
             this.__call = null;
         }
-        if (this._transport) {
-            this._transport.dispose();
-            this._transport = null;
+        if (this._connection) {
+            this._connection.dispose();
+            this._connection = null;
         }
     }
 
@@ -597,7 +617,7 @@ export class ClientSecureChannelLayer extends EventEmitter {
     }
 
     public isValid(): boolean {
-        return this._transport !== null && this._transport.isValid();
+        return this._connection !== null && this._connection.isValid();
     }
 
     public isOpened(): boolean {
@@ -664,7 +684,7 @@ export class ClientSecureChannelLayer extends EventEmitter {
 
             this.__in_normal_close_operation = true;
 
-            if (!this._transport || this._transport.__disconnecting__) {
+            if (!this._connection || !this._connection.isValid) {
                 this.dispose();
                 return callback(new Error("Transport disconnected"));
             }
@@ -676,9 +696,9 @@ export class ClientSecureChannelLayer extends EventEmitter {
     }
 
     public closeWithError(err: Error, callback: ErrorCallback): void {
-        if (this._transport) {
-            this._transport.prematureTerminate(err);
-        }
+        // if (this._transport) {
+        //     this._transport.prematureTerminate(err);
+        // }
         callback();
     }
 
@@ -801,7 +821,7 @@ export class ClientSecureChannelLayer extends EventEmitter {
         if (doDebug && this._requests) {
             debugLog("_cancel_pending_transactions  ",
                 Object.keys(this._requests),
-                this._transport ? this._transport.name : "no transport");
+                this._client ? this._client.name : "no transport");
         }
 
         if (this._requests) {
@@ -836,8 +856,11 @@ export class ClientSecureChannelLayer extends EventEmitter {
          * @param err
          */
         this.emit("close", err);
-        this._transport.dispose();
-        this._transport = null;
+        if (this._connection)
+        {
+            this._connection.dispose();
+            this._connection = null;
+        }
         this._cancel_pending_transactions(err);
         this._cancel_security_token_watchdog();
         this.dispose();
@@ -1015,28 +1038,14 @@ export class ClientSecureChannelLayer extends EventEmitter {
         });
     }
 
-    private _on_connection(transport: ClientTCP_transport, callback: ErrorCallback) {
+    private _on_connection(con: Transport.IConnection, callback: ErrorCallback) {
 
-        this._transport = transport;
-
-        this._transport.on("message", (messageChunk: Buffer) => {
-            /**
-             * notify the observers that ClientSecureChannelLayer has received a message chunk
-             * @event receive_chunk
-             * @param message_chunk
-             */
-            this.emit("receive_chunk", messageChunk);
-            this._on_receive_message_chunk(messageChunk);
-        });
-
-        this._transport.on("close", (err: Error) => this._on_transport_closed(err));
-
-        this._transport.on("connection_break", () => {
+        con.on("close", (err?: Error) => this._on_transport_closed(err))
+        .on("connection_break", () => {
             debugLog(chalk.red("Client => CONNECTION BREAK  <="));
             this._on_transport_closed(new Error("Connection Break"));
-        });
-
-        this._transport.on("error", (err: Error) => {
+        })
+        .on("error", (err?: Error) => {
             debugLog(" ERROR", err);
         });
 
@@ -1051,14 +1060,15 @@ export class ClientSecureChannelLayer extends EventEmitter {
     private _backoff_completion(
         err: Error | undefined,
         lastError: Error | undefined,
-        transport: ClientTCP_transport,
         callback: ErrorCallback
     ) {
 
         if (this.__call) {
             // console log =
-            transport.numberOfRetry = transport.numberOfRetry || 0;
-            transport.numberOfRetry += this.__call.getNumRetries();
+            if (this._connection)
+            {
+                this._connection.numberOfRetry += this.__call.getNumRetries();
+            }
             this.__call.removeAllListeners();
             this.__call = null;
 
@@ -1070,7 +1080,7 @@ export class ClientSecureChannelLayer extends EventEmitter {
         }
     }
 
-    private _connect(transport: ClientTCP_transport, endpointUrl: string, _i_callback: ErrorCallback) {
+    private _connect(con: Transport.IConnection, endpointUrl: string, _i_callback: ErrorCallback) {
 
         if (this.__call && this.__call._cancelBackoff) {
             return;
@@ -1112,30 +1122,30 @@ export class ClientSecureChannelLayer extends EventEmitter {
             _i_callback(err);
         };
 
-        transport.connect(endpointUrl, on_connect);
+        con.connect(endpointUrl, on_connect);
 
     }
 
     private _establish_connection(
-        transport: ClientTCP_transport,
+        con: Transport.IConnection,
         endpointUrl: string,
         callback: ErrorCallback) {
 
-        transport.protocolVersion = this.protocolVersion;
+        this._client!.protocolVersion = this.protocolVersion;
 
         this.lastError = undefined;
 
         if (this.connectionStrategy.maxRetry === 0) {
             debugLog(chalk.cyan("max Retry === 0 =>  No backoff required -> call the _connect function directly"));
             this.__call = 0;
-            return this._connect(transport, endpointUrl, callback);
+            return this._connect(con, endpointUrl, callback);
         }
 
         const connectFunc = (callback2: ErrorCallback) => {
-            return this._connect(transport, endpointUrl, callback2);
+            return this._connect(con, endpointUrl, callback2);
         };
         const completionFunc = (err?: Error) => {
-            return this._backoff_completion(err, this.lastError, transport, callback);
+            return this._backoff_completion(err, this.lastError, callback);
         };
 
         this.__call = backoff.call(connectFunc, completionFunc);
@@ -1173,7 +1183,7 @@ export class ClientSecureChannelLayer extends EventEmitter {
              */
             this.emit("abort");
             setImmediate(() => {
-                this._backoff_completion(undefined, new Error("Connection abandoned"), transport, callback);
+                this._backoff_completion(undefined, new Error("Connection abandoned"), callback);
             });
         });
 
@@ -1365,13 +1375,13 @@ export class ClientSecureChannelLayer extends EventEmitter {
 
         assert(_.isFunction(transactionData.callback));
 
-        if (!this._transport) {
+        if (!this._connection) {
             setTimeout(() => {
                 transactionData.callback(new Error("Client not connected"));
             }, 100);
             return;
         }
-        assert(this._transport, " must have a valid transport");
+        assert(this._connection, " must have a valid transport");
 
         const msgType = transactionData.msgType;
         const request = transactionData.request;
@@ -1448,8 +1458,8 @@ export class ClientSecureChannelLayer extends EventEmitter {
                 debugLog(chalk.yellow(messageHeaderToString(chunk)));
                 debugLog(chalk.red(hexDump(chunk)));
             }
-            assert(this._transport);
-            this._transport.write(chunk);
+            assert(this._stream);
+            this._stream!.write(chunk);
             requestData.chunk_count += 1;
 
         } else {
@@ -1579,8 +1589,8 @@ export class ClientSecureChannelLayer extends EventEmitter {
         };
 
         // use chunk size that has been negotiated by the transport layer
-        if (this._transport.parameters && this._transport.parameters.sendBufferSize) {
-            options.chunkSize = this._transport.parameters.sendBufferSize;
+        if (this.sendBufferSize) {
+            options.chunkSize = this.sendBufferSize;
         }
 
         /* istanbul ignore next */

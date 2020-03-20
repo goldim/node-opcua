@@ -706,6 +706,12 @@ export interface OPCUAServerOptions extends OPCUABaseServerOptions, OPCUAServerE
   timeout?: number;
 
   /**
+   *  the name of low level transport protocol
+   *  @default opc.tcp
+   */
+  protocolName?: string;
+
+  /**
    * the maximum number of simultaneous sessions allowed.
    * @default 10
    */
@@ -1091,6 +1097,7 @@ export class OPCUAServer extends OPCUABaseServer {
         const endPoint = new OPCUAServerEndPoint({
 
           port: port1,
+          protocolName: options1.protocolName,
 
           certificateManager: this.serverCertificateManager,
 

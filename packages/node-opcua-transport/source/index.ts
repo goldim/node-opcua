@@ -1,11 +1,9 @@
 /**
  * @module node-opcua-transport
  */
-export * from "./HelloMessage";
-export * from "./AcknowledgeMessage";
-export * from "./TCPErrorMessage";
-export * from "./client_tcp_transport";
-export * from "./server_tcp_transport";
-export * from "./tcp_transport";
-export * from "./tools";
-export * from "./message_builder_base";
+export * from "./core/HelloMessage";
+export * from "./core/AcknowledgeMessage";
+export * from "./core/TCPErrorMessage";
+export * from "./transport";
+export * from "./core/tools";
+export * from "./core/message_builder_base";

@@ -193,7 +193,7 @@ export class MessageBuilderBase extends EventEmitter {
         if (this.messageHeader.length !== chunk.length) {
             // tslint:disable:max-line-length
             return this._report_error(
-                `Invalid messageChunk size: the provided chunk is ${chunk.length} bytes long but header specifies ${this.messageHeader.length}`);
+              `Invalid messageChunk size: the provided chunk is ${chunk.length} bytes long but header specifies ${this.messageHeader.length}`);
         }
 
         // the start of the message body block

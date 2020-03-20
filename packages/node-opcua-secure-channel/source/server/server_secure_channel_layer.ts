@@ -33,7 +33,7 @@ import {
     SymmetricAlgorithmSecurityHeader
 } from "node-opcua-service-secure-channel";
 import { StatusCode, StatusCodes } from "node-opcua-status-code";
-import { ServerTCP_transport } from "node-opcua-transport";
+import { Transport } from "node-opcua-transport";
 import { get_clock_tick } from "node-opcua-utils";
 
 import { SecureMessageChunkManagerOptions, SecurityHeader } from "../secure_message_chunk_manager";
@@ -214,14 +214,14 @@ export class ServerSecureChannelLayer extends EventEmitter {
      * the number of bytes read so far by this channel
      */
     public get bytesRead() {
-        return this.transport ? this.transport.bytesRead : 0;
+        return this._stream ? this._stream.bytesRead : 0;
     }
 
     /**
      * the number of bytes written so far by this channel
      */
     public get bytesWritten() {
-        return this.transport ? this.transport.bytesWritten : 0;
+        return this._stream ? this._stream.bytesWritten : 0;
     }
 
     public get transactionsCount() {
@@ -291,7 +291,7 @@ export class ServerSecureChannelLayer extends EventEmitter {
     private _securityTokenTimeout: NodeJS.Timer | null;
     private _transactionsCount: number;
     private revisedLifetime: number;
-    private readonly transport: ServerTCP_transport;
+    private _stream: Transport.IStream | null;
     private derivedKeys?: DerivedKeys1;
 
     private objectFactory?: ObjectFactory;
@@ -326,7 +326,7 @@ export class ServerSecureChannelLayer extends EventEmitter {
         this.clientCertificate = null;
         this.clientNonce = null;
 
-        this.transport = new ServerTCP_transport();
+        this._stream = null;
 
         this.__hash = getNextChannelId();
         assert(this.__hash > 0);
@@ -426,9 +426,9 @@ export class ServerSecureChannelLayer extends EventEmitter {
             this.messageChunker.dispose();
             // xx this.messageChunker = null;
         }
-        if (this.transport) {
-            this.transport.dispose();
-            (this as any).transport = null;
+        if (this._stream) {
+            this._stream.dispose();
+            this._stream = null;
         }
         this.channelId = 0xdeadbeef;
         this.timeoutId = null;
@@ -437,11 +437,8 @@ export class ServerSecureChannelLayer extends EventEmitter {
     }
 
     public abruptlyInterrupt() {
-        const clientSocket = this.transport._socket;
-        if (clientSocket) {
-            clientSocket.end();
-            clientSocket.destroy();
-        }
+        if (this._stream)
+            this._stream.close();
     }
 
     /**
@@ -513,35 +510,36 @@ export class ServerSecureChannelLayer extends EventEmitter {
      * @param socket
      * @param callback
      */
-    public init(socket: Socket, callback: ErrorCallback): void {
+    public init(stream: Transport.IStream, callback: ErrorCallback): void {
 
-        this.transport.timeout = this.timeout;
-        debugLog("Setting socket timeout to ", this.transport.timeout);
+        this._stream = stream;
+        debugLog("Setting socket timeout to ", this.timeout);
 
-        this.transport.init(socket, (err?: Error) => {
+
+        // bind low level TCP transport to messageBuilder
+        stream.on("message", (messageChunk: Buffer) => {
+            assert(this.messageBuilder);
+            this.messageBuilder.feed(messageChunk);
+        });
+
+        stream.on("error", (err?: Error) => {
             if (err) {
                 callback(err);
-            } else {
-                // bind low level TCP transport to messageBuilder
-                this.transport.on("message", (messageChunk: Buffer) => {
-                    assert(this.messageBuilder);
-                    this.messageBuilder.feed(messageChunk);
-                });
-                debugLog("ServerSecureChannelLayer : Transport layer has been initialized");
-                debugLog("... now waiting for OpenSecureChannelRequest...");
-
-                ServerSecureChannelLayer.registry.register(this);
-
-                this._wait_for_open_secure_channel_request(callback, this.timeout);
             }
         });
+        debugLog("ServerSecureChannelLayer : Transport layer has been initialized");
+        debugLog("... now waiting for OpenSecureChannelRequest...");
+
+        ServerSecureChannelLayer.registry.register(this);
+
+        this._wait_for_open_secure_channel_request(callback, this.timeout);
 
         // detect transport closure
         this._transport_socket_close_listener = (err?: Error) => {
             debugLog("transport has send socket_closed event " + (err ? err.message : "null"));
             this._abort();
         };
-        this.transport.on("socket_closed", this._transport_socket_close_listener);
+        stream.on("close", this._transport_socket_close_listener);
     }
 
     /**
@@ -589,7 +587,7 @@ export class ServerSecureChannelLayer extends EventEmitter {
 
         let options = {
             channelId: this.securityToken.channelId,
-            chunkSize: this.transport.receiveBufferSize,
+            chunkSize: this._stream!.receiveBufferSize,
             requestId,
             tokenId: this.securityToken.tokenId
         };
@@ -672,7 +670,7 @@ export class ServerSecureChannelLayer extends EventEmitter {
      * @param callback
      */
     public close(callback?: ErrorCallback) {
-        if (!this.transport) {
+        if (!this._stream) {
             if (_.isFunction(callback)) {
                 callback();
             }
@@ -680,12 +678,12 @@ export class ServerSecureChannelLayer extends EventEmitter {
         }
         debugLog("ServerSecureChannelLayer#close");
         // close socket
-        this.transport.disconnect(() => {
-            this._abort();
-            if (_.isFunction(callback)) {
-                callback();
-            }
-        });
+        // this._stream.disconnect(() => {
+        //     this._abort();
+        //     if (_.isFunction(callback)) {
+        //         callback();
+        //     }
+        // });
     }
 
     public has_endpoint_for_security_mode_and_policy(
@@ -701,10 +699,10 @@ export class ServerSecureChannelLayer extends EventEmitter {
     }
 
     public _rememberClientAddressAndPort() {
-        if (this.transport._socket) {
-            this._remoteAddress = this.transport._socket.remoteAddress || "";
-            this._remotePort = this.transport._socket.remotePort || 0;
-        }
+        // if (this.transport._socket) {
+        //     this._remoteAddress = this.transport._socket.remoteAddress || "";
+        //     this._remotePort = this.transport._socket.remotePort || 0;
+        // }
     }
 
     private _stop_security_token_watch_dog() {
@@ -870,7 +868,7 @@ export class ServerSecureChannelLayer extends EventEmitter {
     private _send_chunk(callback: ErrorCallback | undefined, messageChunk: Buffer | null) {
 
         if (messageChunk) {
-            this.transport.write(messageChunk);
+            this._stream!.write(messageChunk);
         } else {
             if (doPerfMonitoring) {
                 // record tick 3 : transaction completed.

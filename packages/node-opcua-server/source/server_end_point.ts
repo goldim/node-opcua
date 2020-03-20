@@ -9,7 +9,7 @@ import * as net from "net";
 import { Server, Socket } from "net";
 import * as path from "path";
 import * as _ from "underscore";
-
+import { Transport } from "node-opcua-transport";
 import { assert } from "node-opcua-assert";
 import {
     ICertificateManager,
@@ -54,10 +54,10 @@ function dumpChannelInfo(channels: ServerSecureChannelLayer[]): void {
         console.log("        bytesWritten  = ", channel.bytesWritten);
         console.log("        bytesRead     = ", channel.bytesRead);
 
-        const socket = (channel as any).transport._socket;
-        if (!socket) {
-            console.log(" SOCKET IS CLOSED");
-        }
+        // const socket = (channel as any).transport._socket;
+        // if (!socket) {
+        //     console.log(" SOCKET IS CLOSED");
+        // }
     }
 
     for (const channel of channels) {
@@ -104,6 +104,12 @@ export interface OPCUAServerEndPointOptions {
      */
     timeout?: number;
 
+    /**
+     *  the name of low level transport protocol
+     *  @default opc.tcp
+     */
+    protocolName?: string;
+
     serverInfo: ApplicationDescription;
 
     objectFactory?: any;
@@ -146,6 +152,7 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
      * the tcp port
      */
     public port: number;
+    public protocolName: string;
     public certificateManager: OPCUACertificateManager;
     public defaultSecureTokenLifetime: number;
     public maxConnections: number;
@@ -162,10 +169,8 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
     private _certificateChain: Certificate;
     private _privateKey: PrivateKeyPEM;
     private _channels: { [key: string]: ServerSecureChannelLayer };
-    private _server?: Server;
+    private _server!: Transport.IServer;
     private _endpoints: EndpointDescription[];
-    private _listen_callback: any;
-    private _started: boolean = false;
     private _counter = OPCUAServerEndPointCounter++;
 
     constructor(options: OPCUAServerEndPointOptions) {
@@ -180,6 +185,8 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
 
         options.port = options.port || 0;
 
+        console.info("PROTOCOL: ", options.protocolName);
+        this.protocolName = (options.protocolName !== undefined) ? options.protocolName : "opc.tcp";
         this.port = parseInt(options.port.toString(), 10);
         assert(_.isNumber(this.port));
 
@@ -194,9 +201,8 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
 
         this.timeout = options.timeout || 30000;
 
-        this._server = undefined;
-
-        this._setup_server();
+        this._server = Transport.Factory.getServer(this.port, this.protocolName);
+        this._server.setAcceptHandler(this._on_client_connection.bind(this));
 
         this._endpoints = [];
 
@@ -224,8 +230,7 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
         assert(this._endpoints.length === 0, "endpoints must have been deleted");
         this._endpoints = [];
 
-        this._server = undefined;
-        this._listen_callback = null;
+        this._server.dispose();
 
         this.removeAllListeners();
 
@@ -421,26 +426,7 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
      * @async
      */
     public listen(callback: (err?: Error) => void) {
-
-        assert(_.isFunction(callback));
-        assert(!this._started, "OPCUAServerEndPoint is already listening");
-
-        this._listen_callback = callback;
-
-        this._server!.on("error", (err: Error) => {
-            debugLog(chalk.red.bold(" error") + " port = " + this.port, err);
-            this._started = false;
-            this._end_listen(err);
-        });
-        this._server!.on("listening", () => {
-            debugLog("server is listening");
-        });
-        this._server!.listen(this.port, /*"::",*/ (err?: Error) => { // 'listening' listener
-            debugLog(chalk.green.bold("LISTENING TO PORT "), this.port, "err  ", err);
-            assert(!err, " cannot listen to port ");
-            this._started = true;
-            this._end_listen();
-        });
+        this._server.listen(callback);
     }
 
     public killClientSockets(callback: (err?: Error) => void) {
@@ -459,7 +445,7 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
 
     public suspendConnection(callback: (err?: Error) => void) {
 
-        if (!this._started) {
+        if (!this._server.isListening()) {
             return callback(new Error("Connection already suspended !!"));
         }
 
@@ -470,10 +456,9 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
         // Unlike that event, it will be called with an Error as its only argument
         // if the server was not open when it was closed.
         this._server!.close(() => {
-            this._started = false;
             debugLog("Connection has been closed !");
         });
-        this._started = false;
+        
         callback();
     }
 
@@ -496,7 +481,7 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
 
         debugLog("OPCUAServerEndPoint#shutdown ");
 
-        if (this._started) {
+        if (this._server.isListening()) {
             // make sure we don't accept new connection any more ...
             this.suspendConnection(() => {
                 // shutdown all opened channels ...
@@ -526,7 +511,7 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
      */
     public start(callback: (err?: Error) => void): void {
         assert(_.isFunction(callback));
-        this.listen(callback);
+        this._server.listen(callback);
     }
 
     public get bytesWritten(): number {
@@ -569,51 +554,13 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
 
         const self = this;
 
-        self._server!.getConnections((err: Error | null, count: number) => {
-            debugLog(chalk.cyan("CONCURRENT CONNECTION = "), count);
-        });
+        // self._server!.getConnections((err: Error | null, count: number) => {
+        //     debugLog(chalk.cyan("CONCURRENT CONNECTION = "), count);
+        // });
         debugLog(chalk.cyan("MAX CONNECTIONS = "), self._server!.maxConnections);
     }
 
-    private _setup_server() {
-
-        assert(!this._server);
-        this._server = net.createServer({ pauseOnConnect: true }, this._on_client_connection.bind(this));
-
-        // xx console.log(" Server with max connections ", self.maxConnections);
-        this._server.maxConnections = this.maxConnections + 1; // plus one extra
-
-        this._listen_callback = null;
-        this._server.on("connection", (socket: NodeJS.Socket) => {
-
-            // istanbul ignore next
-            if (doDebug) {
-                this._dump_statistics();
-                debugLog("server connected  with : " +
-                  (socket as any).remoteAddress + ":" + (socket as any).remotePort);
-            }
-
-        }).on("close", () => {
-            debugLog("server closed : all connections have ended");
-        }).on("error", (err: Error) => {
-            // this could be because the port is already in use
-            debugLog(chalk.red.bold("server error: "), err.message);
-        });
-    }
-
-    private _on_client_connection(socket: Socket) {
-
-        // a client is attempting a connection on the socket
-        (socket as any).setNoDelay(true);
-
-        debugLog("OPCUAServerEndPoint#_on_client_connection", this._started);
-        if (!this._started) {
-            debugLog(chalk.bgWhite.cyan("OPCUAServerEndPoint#_on_client_connection " +
-              "SERVER END POINT IS PROBABLY SHUTTING DOWN !!! - Connection is refused"));
-            socket.end();
-            return;
-        }
-
+    private _on_client_connection(stream: Transport.IStream) {
         const establish_connection = () => {
 
             const nbConnections = Object.keys(this._channels).length;
@@ -622,8 +569,8 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
             if (nbConnections >= this.maxConnections) {
                 debugLog(chalk.bgWhite.cyan("OPCUAServerEndPoint#_on_client_connection " +
                   "The maximum number of connection has been reached - Connection is refused"));
-                socket.end();
-                (socket as any).destroy();
+                stream.close();
+                stream.dispose();
                 return;
             }
 
@@ -636,15 +583,13 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
                 timeout: this.timeout
             });
 
-            socket.resume();
-
             this._preregisterChannel(channel);
 
-            channel.init(socket, (err?: Error) => {
+            channel.init(stream, (err?: Error) => {
                 this._un_pre_registerChannel(channel);
                 debugLog(chalk.yellow.bold("Channel#init done"), err);
                 if (err) {
-                    socket.end();
+                    stream.close();
                 } else {
                     debugLog("server receiving a client connection");
                     this._registerChannel(channel);
@@ -669,7 +614,7 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
         // that are in early stage of the hand shaking process.
         // e.g HEL/ACK and OpenSecureChannel may not have been received yet
         // as they will need to be interrupted when OPCUAServerEndPoint is closed
-        assert(this._started, "OPCUAServerEndPoint must be started");
+        assert(this._server.isListening(), "OPCUAServerEndPoint must be started");
 
         assert(!this._channels.hasOwnProperty(channel.hashKey), " channel already preregistered!");
 
@@ -703,7 +648,7 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
      */
     private _registerChannel(channel: ServerSecureChannelLayer) {
 
-        if (this._started) {
+        if (this._server.isListening()) {
 
             debugLog(chalk.red("_registerChannel = "), "channel.hashKey = ", channel.hashKey);
 
@@ -762,12 +707,6 @@ export class OPCUAServerEndPoint extends EventEmitter implements ServerSecureCha
         }
 
         /// channel.dispose();
-    }
-
-    private _end_listen(err?: Error) {
-        assert(_.isFunction(this._listen_callback));
-        this._listen_callback(err);
-        this._listen_callback = null;
     }
 
     /**
